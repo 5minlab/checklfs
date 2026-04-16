@@ -27,9 +27,12 @@ impl MetaStatus {
     }
 }
 
-fn test_meta_ignore(name: &str) -> bool {
+fn test_meta_ignore(name: &str, is_dir: bool) -> bool {
     // Unity3d ignores following files
-    name.starts_with(".") || name.ends_with("~")
+    let meta_base = name.strip_suffix(".meta").unwrap_or(name);
+    name.starts_with(".")
+        || name.ends_with("~")
+        || (meta_base.ends_with(".androidlib") && (is_dir || name != meta_base))
 }
 
 fn test_meta<P: AsRef<Path>>(repo_root: P, commit_id: &str) -> Result<usize> {
@@ -50,7 +53,7 @@ fn test_meta<P: AsRef<Path>>(repo_root: P, commit_id: &str) -> Result<usize> {
         let full_path = Path::new(base_path).join(name);
         let path_str = full_path.to_str().unwrap();
 
-        if test_meta_ignore(name) {
+        if test_meta_ignore(name, entry.kind() == Some(ObjectType::Tree)) {
             return TreeWalkResult::Skip;
         }
 
