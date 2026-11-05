@@ -86,7 +86,13 @@ fn test_meta<P: AsRef<Path>>(repo_root: P, commit_id: &str) -> Result<usize> {
             }
         }
 
-        TreeWalkResult::Ok
+        // Unity imports a .bundle directory as one asset. Its own .meta is
+        // required, but its contents do not have individual Unity metadata.
+        if entry.kind() == Some(ObjectType::Tree) && name.ends_with(".bundle") {
+            TreeWalkResult::Skip
+        } else {
+            TreeWalkResult::Ok
+        }
     })?;
 
     for (path, status) in names {
@@ -256,4 +262,77 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(files: &[(&str, &[u8])]) -> (tempfile::TempDir, Repository, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        // Keep both case variants in the index on case-insensitive macOS volumes.
+        repo.config()
+            .unwrap()
+            .set_bool("core.ignorecase", false)
+            .unwrap();
+        let mut index = repo.index().unwrap();
+        for (name, content) in files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+            index.add_path(Path::new(name)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = index.write_tree().unwrap().to_string();
+        (dir, repo, tree)
+    }
+
+    #[test]
+    fn bundle_contents_do_not_need_metadata() {
+        let (dir, _repo, tree) = fixture(&[
+            ("Assets/Example.bundle.meta", b""),
+            ("Assets/Example.bundle/Contents/Info.plist", b"plist"),
+            ("Assets/Example.bundle/Contents/MacOS/Example", b"binary"),
+        ]);
+        assert_eq!(test_meta(dir.path(), &tree).unwrap(), 0);
+    }
+
+    #[test]
+    fn bundle_itself_still_needs_metadata() {
+        let (dir, _repo, tree) =
+            fixture(&[("Assets/Example.bundle/Contents/Info.plist", b"plist")]);
+        assert_eq!(test_meta(dir.path(), &tree).unwrap(), 1);
+    }
+
+    #[test]
+    fn orphan_bundle_metadata_is_reported() {
+        let (dir, _repo, tree) = fixture(&[("Assets/Example.bundle.meta", b"")]);
+        assert_eq!(test_meta(dir.path(), &tree).unwrap(), 1);
+    }
+
+    #[test]
+    fn ordinary_directories_still_check_contents() {
+        let (dir, _repo, tree) = fixture(&[
+            ("Assets/Example.meta", b""),
+            ("Assets/Example/UntrackedAsset.txt", b"asset"),
+        ]);
+        assert_eq!(test_meta(dir.path(), &tree).unwrap(), 1);
+    }
+
+    #[test]
+    fn bundle_contents_still_receive_lfs_and_case_checks() {
+        let (dir, _repo, tree) = fixture(&[
+            (
+                ".gitattributes",
+                b"*.png filter=lfs diff=lfs merge=lfs -text\n",
+            ),
+            ("Assets/Example.bundle.meta", b""),
+            ("Assets/Example.bundle/Texture.png", &[b'x'; 200]),
+            ("Assets/Example.bundle/texture.png", b"small"),
+        ]);
+        assert_eq!(test_meta(dir.path(), &tree).unwrap(), 0);
+        assert_eq!(test_lfs(dir.path(), &tree).unwrap(), 1);
+        assert_eq!(test_case(dir.path(), &tree).unwrap(), 1);
+    }
 }
