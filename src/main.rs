@@ -153,27 +153,38 @@ fn test_lfs_walk<'a>(
         Some(name) => name,
         None => return Ok(0),
     };
+    if entry.kind() != Some(ObjectType::Blob) {
+        return Ok(0);
+    }
 
     let full_path = Path::new(base_path).join(name);
+    let (size, _) = repo.odb()?.read_header(entry.id())?;
+    if size < 1024 {
+        let blob = repo.find_blob(entry.id())?;
+        let content = blob.content();
+        let is_pointer = content.starts_with(b"version https://git-lfs.github.com/spec/v1\n")
+            || content.starts_with(b"version https://hawser.github.com/spec/v1\n");
+        if is_pointer {
+            let filter = repo.get_attr(&full_path, "filter", git2::AttrCheckFlags::INDEX_ONLY)?;
+            if filter != Some("lfs") {
+                error!("LFS pointer has no filter=lfs attribute: {:?}", full_path);
+                return Ok(1);
+            }
+            return Ok(0);
+        }
+    }
+
     let attr = repo.get_attr(&full_path, "merge", git2::AttrCheckFlags::INDEX_ONLY)?;
     if attr != Some("lfs") {
         return Ok(0);
     }
 
-    let obj = entry.to_object(repo)?;
-    if let Some(ObjectType::Blob) = obj.kind() {
-        let blob = obj.peel_to_blob()?;
-        let size = blob.size();
-
-        // TODO: check content
-        if size < 150 {
-            return Ok(0);
-        }
-        error!("should be in LFS: {:?}, {}", full_path, size);
-        Ok(1)
-    } else {
-        Ok(0)
+    // TODO: check content
+    if size < 150 {
+        return Ok(0);
     }
+    error!("should be in LFS: {:?}, {}", full_path, size);
+    Ok(1)
 }
 
 fn test_lfs<P: AsRef<Path>>(repo_root: P, commit_id: &str) -> Result<usize> {
@@ -183,13 +194,25 @@ fn test_lfs<P: AsRef<Path>>(repo_root: P, commit_id: &str) -> Result<usize> {
     let commit_id = git2::Oid::from_str(commit_id)?;
     let tree = repo.find_tree(commit_id)?;
     let mut count = 0;
+    let mut walk_error = None;
 
-    tree.walk(TreeWalkMode::PreOrder, |base_path, entry| {
-        if let Ok(num) = test_lfs_walk(&repo, base_path, entry) {
-            count += num;
-        }
-        TreeWalkResult::Ok
-    })?;
+    let walk_result = tree.walk(
+        TreeWalkMode::PreOrder,
+        |base_path, entry| match test_lfs_walk(&repo, base_path, entry) {
+            Ok(num) => {
+                count += num;
+                TreeWalkResult::Ok
+            }
+            Err(error) => {
+                walk_error = Some(error);
+                TreeWalkResult::Abort
+            }
+        },
+    );
+    if let Some(error) = walk_error {
+        return Err(error);
+    }
+    walk_result?;
 
     info!("checking invalid lfs files: done");
     Ok(count)
@@ -268,6 +291,8 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1\noid sha256:319c9514a233ef13eb837e4c358d501a336315df79544fc3227e9aad3651b28a\nsize 15446949\n";
+
     fn fixture(files: &[(&str, &[u8])]) -> (tempfile::TempDir, Repository, String) {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -334,5 +359,58 @@ mod tests {
         assert_eq!(test_meta(dir.path(), &tree).unwrap(), 0);
         assert_eq!(test_lfs(dir.path(), &tree).unwrap(), 1);
         assert_eq!(test_case(dir.path(), &tree).unwrap(), 1);
+    }
+
+    #[test]
+    fn uppercase_pointer_without_matching_attributes_is_reported() {
+        for ignore_case in [false, true] {
+            let (dir, repo, tree) = fixture(&[
+                (
+                    ".gitattributes",
+                    b"*.exr filter=lfs diff=lfs merge=lfs -text\n",
+                ),
+                ("Assets/Texture.EXR", LFS_POINTER),
+            ]);
+            repo.config()
+                .unwrap()
+                .set_bool("core.ignorecase", ignore_case)
+                .unwrap();
+            assert_eq!(test_lfs(dir.path(), &tree).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn uppercase_pointer_with_matching_attributes_passes() {
+        let (dir, _repo, tree) = fixture(&[
+            (
+                ".gitattributes",
+                b"*.EXR filter=lfs diff=lfs merge=lfs -text\n",
+            ),
+            ("Assets/Texture.EXR", LFS_POINTER),
+        ]);
+        assert_eq!(test_lfs(dir.path(), &tree).unwrap(), 0);
+    }
+
+    #[test]
+    fn merge_attribute_alone_does_not_make_a_pointer_safe() {
+        let (dir, _repo, tree) = fixture(&[
+            (".gitattributes", b"*.EXR merge=lfs\n"),
+            ("Assets/Texture.EXR", LFS_POINTER),
+        ]);
+        assert_eq!(test_lfs(dir.path(), &tree).unwrap(), 1);
+    }
+
+    #[test]
+    fn missing_objects_fail_the_check() {
+        let (dir, repo, tree) = fixture(&[("Assets/Texture.EXR", LFS_POINTER)]);
+        let oid = repo
+            .find_tree(Oid::from_str(&tree).unwrap())
+            .unwrap()
+            .get_path(Path::new("Assets/Texture.EXR"))
+            .unwrap()
+            .id()
+            .to_string();
+        std::fs::remove_file(repo.path().join("objects").join(&oid[..2]).join(&oid[2..])).unwrap();
+        assert!(test_lfs(dir.path(), &tree).is_err());
     }
 }
